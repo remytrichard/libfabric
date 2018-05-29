@@ -184,12 +184,9 @@ void rxm_ep_handle_postponed_rma_op(struct rxm_ep *rxm_ep,
 				    struct rxm_tx_entry *tx_entry)
 {
 	ssize_t ret;
-	struct util_cntr *cntr;
-	struct util_cq *cq;
-	struct fi_cq_err_entry err_entry;
 
 	FI_DBG(&rxm_prov, FI_LOG_EP_DATA,
-	       "Perform deffered RMA operation (len - %zd) for %p conn\n",
+	       "Perform deferred RMA operation (len - %zd) for %p conn\n",
 	       tx_entry->rma_buf->pkt.hdr.size, rxm_conn);
 
 	if (tx_entry->comp_flags & FI_WRITE) {
@@ -200,35 +197,26 @@ void rxm_ep_handle_postponed_rma_op(struct rxm_ep *rxm_ep,
 				  &tx_entry->rma_buf->msg,
 				  flags);
 		if (OFI_UNLIKELY(ret)) {
-			cntr = rxm_ep->util_ep.wr_cntr;
-			cq = rxm_ep->util_ep.tx_cq;
-			goto err;
+			rxm_cq_write_error(rxm_ep->util_ep.tx_cq,
+					   rxm_ep->util_ep.wr_cntr,
+					   tx_entry->context, (int)ret);
+			FI_WARN(&rxm_prov, FI_LOG_EP_DATA,
+				"Unable to perform deferred RMA write operation\n");
 		}
 	} else if (tx_entry->comp_flags & FI_READ) {
 		ret = fi_readmsg(rxm_conn->msg_ep,
 				 &tx_entry->rma_buf->msg,
 				 tx_entry->flags);
 		if (OFI_UNLIKELY(ret)) {
-			cntr = rxm_ep->util_ep.rd_cntr;
-			cq = rxm_ep->util_ep.tx_cq;
-			goto err;
+			rxm_cq_write_error(rxm_ep->util_ep.tx_cq,
+					   rxm_ep->util_ep.rd_cntr,
+					   tx_entry->context, (int)ret);
+			FI_WARN(&rxm_prov, FI_LOG_EP_DATA,
+				"Unable to perform deferred RMA read operation\n");
 		}
 	} else {
 		assert(0);
 	}
-
-	return;
-err:
-	FI_WARN(&rxm_prov, FI_LOG_EP_DATA,
-		"Unable to perform deffered RMA operation\n");
-
-	memset(&err_entry, 0, sizeof(err_entry));
-	err_entry.op_context = tx_entry->context;
-	err_entry.prov_errno = (int)ret;
-
-	rxm_cntr_incerr(cntr);
-	if (ofi_cq_write_error(cq, &err_entry))
-		assert(0);
 }
 
 static inline ssize_t
@@ -312,20 +300,18 @@ rxm_ep_rma_common(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg, uint64_t 
 {
 	struct rxm_tx_entry *tx_entry;
 	struct fi_msg_rma msg_rma = *msg;
-	struct util_cmap_handle *handle;
 	struct rxm_conn *rxm_conn;
 	void *mr_desc[RXM_IOV_LIMIT] = { 0 };
 	int ret;
 
 	fastlock_acquire(&rxm_ep->util_ep.cmap->lock);
-	handle = ofi_cmap_acquire_handle(rxm_ep->util_ep.cmap, msg->addr);
-	if (OFI_UNLIKELY(!handle || handle->state != CMAP_CONNECTED)) {
-		ret = rxm_ep_handle_unconnected(rxm_ep, &handle, msg->addr);
+	rxm_conn = rxm_acquire_conn(rxm_ep, msg->addr);
+	if (OFI_UNLIKELY(rxm_conn->handle.state != CMAP_CONNECTED)) {
+		ret = rxm_ep_handle_unconnected(rxm_ep, &rxm_conn->handle, msg->addr);
 		if (!ret)
 			goto rma_continue;
 		else if (OFI_UNLIKELY(ret != -FI_EAGAIN))
 			goto cmap_err;
-		rxm_conn = container_of(handle, struct rxm_conn, handle);
 		ret = rxm_ep_postpone_rma(rxm_ep, rxm_conn,
 					  ofi_total_iov_len(msg->msg_iov,
 							    msg->iov_count),
@@ -336,7 +322,6 @@ cmap_err:
 	}
 rma_continue:
 	fastlock_release(&rxm_ep->util_ep.cmap->lock);
-	rxm_conn = container_of(handle, struct rxm_conn, handle);
 
 	ret = rxm_ep_format_rma_res_lightweight(rxm_ep, flags, comp_flags,
 						msg, &tx_entry);
@@ -431,20 +416,18 @@ rxm_ep_rma_inject(struct rxm_ep *rxm_ep, const struct fi_msg_rma *msg, uint64_t 
 {
 	struct rxm_tx_entry *tx_entry;
 	struct rxm_rma_buf *rma_buf;
-	struct util_cmap_handle *handle;
 	struct rxm_conn *rxm_conn;
 	size_t total_size = ofi_total_iov_len(msg->msg_iov, msg->iov_count);
 	ssize_t ret;
 
 	fastlock_acquire(&rxm_ep->util_ep.cmap->lock);
-	handle = ofi_cmap_acquire_handle(rxm_ep->util_ep.cmap, msg->addr);
-	if (OFI_UNLIKELY(!handle || handle->state != CMAP_CONNECTED)) {
-		ret = rxm_ep_handle_unconnected(rxm_ep, &handle, msg->addr);
+	rxm_conn = rxm_acquire_conn(rxm_ep, msg->addr);
+	if (OFI_UNLIKELY(rxm_conn->handle.state != CMAP_CONNECTED)) {
+		ret = rxm_ep_handle_unconnected(rxm_ep, &rxm_conn->handle, msg->addr);
 		if (!ret)
 			goto rma_inject_continue;
 		else if (OFI_UNLIKELY(ret != -FI_EAGAIN))
 			goto cmap_err;
-		rxm_conn = container_of(handle, struct rxm_conn, handle);
 		ret = rxm_ep_postpone_rma(rxm_ep, rxm_conn, total_size,
 					  flags, FI_WRITE, msg);
 cmap_err:
@@ -453,7 +436,6 @@ cmap_err:
 	}
 rma_inject_continue:
 	fastlock_release(&rxm_ep->util_ep.cmap->lock);
-	rxm_conn = container_of(handle, struct rxm_conn, handle);
 
 	if (OFI_UNLIKELY(total_size > rxm_ep->rxm_info->tx_attr->inject_size))
 		return -FI_EMSGSIZE;

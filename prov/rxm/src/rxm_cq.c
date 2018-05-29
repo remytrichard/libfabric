@@ -148,8 +148,7 @@ static int rxm_finish_recv(struct rxm_rx_buf *rx_buf, size_t done_len)
 		ret = ofi_cq_write_error_trunc(rx_buf->ep->util_ep.rx_cq,
 					       rx_buf->recv_entry->context,
 					       rx_buf->recv_entry->comp_flags |
-					       ((rx_buf->pkt.hdr.flags & OFI_REMOTE_CQ_DATA) ?
-					        FI_REMOTE_CQ_DATA : 0),
+					       rx_buf->pkt.hdr.flags,
 					       rx_buf->pkt.hdr.size,
 					       rx_buf->recv_entry->rxm_iov.iov[0].iov_base,
 					       rx_buf->pkt.hdr.data, rx_buf->pkt.hdr.tag,
@@ -169,8 +168,7 @@ static int rxm_finish_recv(struct rxm_rx_buf *rx_buf, size_t done_len)
 			ret = ofi_cq_write(rx_buf->ep->util_ep.rx_cq,
 					   rx_buf->recv_entry->context,
 					   rx_buf->recv_entry->comp_flags |
-					   ((rx_buf->pkt.hdr.flags & OFI_REMOTE_CQ_DATA) ?
-					    FI_REMOTE_CQ_DATA : 0),
+					   rx_buf->pkt.hdr.flags,
 					   rx_buf->pkt.hdr.size,
 					   rx_buf->recv_entry->rxm_iov.iov[0].iov_base,
 					   rx_buf->pkt.hdr.data, rx_buf->pkt.hdr.tag);
@@ -238,6 +236,20 @@ static inline int rxm_finish_send(struct rxm_tx_entry *tx_entry)
 {
 	rxm_tx_buf_release(tx_entry->ep, tx_entry->tx_buf);
 	return rxm_finish_send_nobuf(tx_entry);
+}
+
+static inline int rxm_finish_sar_segment_send(struct rxm_tx_entry *tx_entry)
+{
+	struct rxm_tx_buf *tx_buf;
+
+	dlist_pop_front(&tx_entry->in_flight_tx_buf_list, struct rxm_tx_buf,
+			tx_buf, in_flight_entry);
+
+	rxm_tx_buf_release(tx_entry->ep, tx_buf);
+	/* If `segs_left` == 0, all segments of the message have been fully sent */
+	if (!--tx_entry->segs_left)
+		return rxm_finish_send_nobuf(tx_entry);
+	return FI_SUCCESS;
 }
 
 static inline int rxm_finish_send_lmt_ack(struct rxm_rx_buf *rx_buf)
@@ -361,15 +373,11 @@ ssize_t rxm_cq_handle_data(struct rxm_rx_buf *rx_buf)
 
 ssize_t rxm_cq_handle_rx_buf(struct rxm_rx_buf *rx_buf)
 {
-	switch (rx_buf->pkt.ctrl_hdr.type) {
-	case ofi_ctrl_data:
+	if (OFI_LIKELY(rx_buf->pkt.ctrl_hdr.type == ofi_ctrl_data)) {
 		return rxm_cq_handle_data(rx_buf);
-	case ofi_ctrl_large_data:
+	} else {
+		assert(rx_buf->pkt.ctrl_hdr.type == ofi_ctrl_large_data);
 		return rxm_cq_handle_large_data(rx_buf);
-	default:
-		FI_WARN(&rxm_prov, FI_LOG_CQ, "Unknown message type\n");
-		assert(0);
-		return -FI_EINVAL;
 	}
 }
 
@@ -541,7 +549,7 @@ static ssize_t rxm_cq_handle_comp(struct rxm_ep *rxm_ep,
 	if (comp->flags & FI_REMOTE_WRITE)
 		return rxm_handle_remote_write(rxm_ep, comp);
 
-	switch (RXM_GET_PROTO_STATE(comp)) {
+	switch (RXM_GET_PROTO_STATE(comp->op_context)) {
 	case RXM_TX_NOBUF:
 		assert(comp->flags & (FI_SEND | FI_WRITE | FI_READ));
 		if (tx_entry->ep->msg_mr_local && !tx_entry->ep->rxm_mr_local)
@@ -550,6 +558,9 @@ static ssize_t rxm_cq_handle_comp(struct rxm_ep *rxm_ep,
 	case RXM_TX:
 		assert(comp->flags & FI_SEND);
 		return rxm_finish_send(tx_entry);
+	case RXM_SAR_TX:
+		assert(comp->flags & FI_SEND);
+		return rxm_finish_sar_segment_send(tx_entry);
 	case RXM_TX_RMA:
 		assert(comp->flags & (FI_WRITE | FI_READ));
 		if (tx_entry->ep->msg_mr_local && !tx_entry->ep->rxm_mr_local)
@@ -594,38 +605,80 @@ static ssize_t rxm_cq_handle_comp(struct rxm_ep *rxm_ep,
 	}
 }
 
-ssize_t rxm_cq_write_error(struct fid_cq *msg_cq, struct fi_cq_data_entry *comp,
-			   ssize_t err)
+void rxm_cq_write_error(struct util_cq *cq, struct util_cntr *cntr,
+			void *op_context, int err)
+{
+	struct fi_cq_err_entry err_entry = {0};
+	err_entry.op_context = op_context;
+	err_entry.prov_errno = err;
+	err_entry.err = err;
+
+	if (cntr)
+		rxm_cntr_incerr(cntr);
+	if (ofi_cq_write_error(cq, &err_entry)) {
+		FI_WARN(&rxm_prov, FI_LOG_CQ, "Unable to ofi_cq_write_error\n");
+		assert(0);
+	}
+}
+
+static void rxm_cq_write_error_all(struct rxm_ep *rxm_ep, int err)
+{
+	struct fi_cq_err_entry err_entry = {0};
+	ssize_t ret = 0;
+
+	err_entry.prov_errno = err;
+	err_entry.err = err;
+	if (rxm_ep->util_ep.tx_cq) {
+		ret = ofi_cq_write_error(rxm_ep->util_ep.tx_cq, &err_entry);
+		if (ret) {
+			FI_WARN(&rxm_prov, FI_LOG_CQ,
+				"Unable to ofi_cq_write_error\n");
+			assert(0);
+		}
+	}
+	if (rxm_ep->util_ep.rx_cq) {
+		ret = ofi_cq_write_error(rxm_ep->util_ep.rx_cq, &err_entry);
+		if (ret) {
+			FI_WARN(&rxm_prov, FI_LOG_CQ,
+				"Unable to ofi_cq_write_error\n");
+			assert(0);
+		}
+	}
+	if (rxm_ep->util_ep.tx_cntr)
+		rxm_cntr_incerr(rxm_ep->util_ep.tx_cntr);
+
+	if (rxm_ep->util_ep.rx_cntr)
+		rxm_cntr_incerr(rxm_ep->util_ep.rx_cntr);
+
+	if (rxm_ep->util_ep.wr_cntr)
+		rxm_cntr_incerr(rxm_ep->util_ep.wr_cntr);
+
+	if (rxm_ep->util_ep.rd_cntr)
+		rxm_cntr_incerr(rxm_ep->util_ep.rd_cntr);
+}
+
+static void rxm_cq_read_write_error(struct rxm_ep *rxm_ep)
 {
 	struct rxm_tx_entry *tx_entry;
 	struct rxm_rx_buf *rx_buf;
-	struct fi_cq_err_entry err_entry;
+	struct fi_cq_err_entry err_entry = {0};
 	struct util_cq *util_cq;
 	struct util_cntr *util_cntr = NULL;
-	void *op_context;
 	ssize_t ret;
 
-	op_context = comp->op_context;
-	memset(&err_entry, 0, sizeof(err_entry));
-
-	if (err == -FI_EAVAIL) {
-		OFI_CQ_READERR(&rxm_prov, FI_LOG_CQ, msg_cq, ret, err_entry);
-		if (ret < 0) {
-			FI_WARN(&rxm_prov, FI_LOG_CQ,
-					"Unable to fi_cq_readerr on msg cq\n");
-			err_entry.prov_errno = (int)ret;
-			err = ret;
-		} else {
-			op_context = err_entry.op_context;
-		}
-	} else {
-		err_entry.prov_errno = (int)err;
+	OFI_CQ_READERR(&rxm_prov, FI_LOG_CQ, rxm_ep->msg_cq, ret,
+		       err_entry);
+	if (ret < 0) {
+		FI_WARN(&rxm_prov, FI_LOG_CQ,
+			"Unable to fi_cq_readerr on msg cq\n");
+		rxm_cq_write_error_all(rxm_ep, (int)ret);
+		return;
 	}
 
-	switch (RXM_GET_PROTO_STATE(comp)) {
+	switch (RXM_GET_PROTO_STATE(err_entry.op_context)) {
 	case RXM_TX:
 	case RXM_LMT_TX:
-		tx_entry = (struct rxm_tx_entry *)op_context;
+		tx_entry = (struct rxm_tx_entry *)err_entry.op_context;
 		util_cq = tx_entry->ep->util_ep.tx_cq;
 		if (tx_entry->ep->util_ep.flags & OFI_CNTR_ENABLED) {
 			if (tx_entry->comp_flags & FI_SEND)
@@ -637,26 +690,31 @@ ssize_t rxm_cq_write_error(struct fid_cq *msg_cq, struct fi_cq_data_entry *comp,
 		}
 		break;
 	case RXM_LMT_ACK_SENT:
-		tx_entry = (struct rxm_tx_entry *)op_context;
+		tx_entry = (struct rxm_tx_entry *)err_entry.op_context;
 		util_cq = tx_entry->ep->util_ep.rx_cq;
 		util_cntr = tx_entry->ep->util_ep.rx_cntr;
 		break;
 	case RXM_RX:
 	case RXM_LMT_READ:
-		rx_buf = (struct rxm_rx_buf *)op_context;
+		rx_buf = (struct rxm_rx_buf *)err_entry.op_context;
 		util_cq = rx_buf->ep->util_ep.rx_cq;
 		util_cntr = rx_buf->ep->util_ep.rx_cntr;
 		break;
 	default:
 		FI_WARN(&rxm_prov, FI_LOG_CQ, "Invalid state!\n");
-		if (err == -FI_EAVAIL)
-			FI_WARN(&rxm_prov, FI_LOG_CQ, "msg cq error info: %s\n",
-				fi_cq_strerror(msg_cq, err_entry.prov_errno,
-					       err_entry.err_data, NULL, 0));
-		return -FI_EOPBADSTATE;
+		FI_WARN(&rxm_prov, FI_LOG_CQ, "msg cq error info: %s\n",
+			fi_cq_strerror(rxm_ep->msg_cq, err_entry.prov_errno,
+				       err_entry.err_data, NULL, 0));
+		rxm_cq_write_error_all(rxm_ep, -FI_EOPBADSTATE);
+		return;
 	}
-	rxm_cntr_incerr(util_cntr);
-	return ofi_cq_write_error(util_cq, &err_entry);
+	if (util_cntr)
+		rxm_cntr_incerr(util_cntr);
+	ret = ofi_cq_write_error(util_cq, &err_entry);
+	if (ret) {
+		FI_WARN(&rxm_prov, FI_LOG_CQ, "Unable to ofi_cq_write_error\n");
+		assert(0);
+	}
 }
 
 static inline int rxm_ep_repost_buf(struct rxm_rx_buf *rx_buf)
@@ -806,17 +864,20 @@ void rxm_ep_progress_one(struct util_ep *util_ep)
 	ret = fi_cq_read(rxm_ep->msg_cq, &comp, 1);
 	if (ret == -FI_EAGAIN || !ret)
 		return;
-	if (OFI_UNLIKELY(ret < 0))
-		goto err;
+	if (OFI_UNLIKELY(ret < 0)) {
+		if (ret == -FI_EAVAIL)
+			rxm_cq_read_write_error(rxm_ep);
+		else
+			rxm_cq_write_error_all(rxm_ep, ret);
+		return;
+	}
 
+	// TODO handle errors internally and make this function return void.
+	// We don't have enough info to write a good error entry to the CQ at
+	// this point
 	ret = rxm_cq_handle_comp(rxm_ep, &comp);
 	if (OFI_UNLIKELY(ret))
-		goto err;
-
-	return;
-err:
-	if (rxm_cq_write_error(rxm_ep->msg_cq, &comp, ret))
-		assert(0);
+		rxm_cq_write_error_all(rxm_ep, ret);
 }
 
 void rxm_ep_progress_multi(struct util_ep *util_ep)
@@ -839,20 +900,25 @@ void rxm_ep_progress_multi(struct util_ep *util_ep)
 		ret = fi_cq_read(rxm_ep->msg_cq, &comp, 1);
 		if (ret == -FI_EAGAIN)
 			return;
-		if (OFI_UNLIKELY(ret < 0))
-			goto err;
+		if (OFI_UNLIKELY(ret < 0)) {
+			if (ret == -FI_EAVAIL)
+				rxm_cq_read_write_error(rxm_ep);
+			else
+				rxm_cq_write_error_all(rxm_ep, ret);
+			return;
+		}
 		if (ret) {
+			// TODO handle errors internally and make this function
+			// return void. we don't have enough info to write a
+			// good error entry to the CQ at this point
 			ret = rxm_cq_handle_comp(rxm_ep, &comp);
-			if (OFI_UNLIKELY(ret))
-				goto err;
+			if (OFI_UNLIKELY(ret)) {
+				rxm_cq_write_error_all(rxm_ep, ret);
+				return;
+			}
 			comp_read++;
 		}
 	} while (comp_read < rxm_ep->comp_per_progress);
-
-	return;
-err:
-	if (rxm_cq_write_error(rxm_ep->msg_cq, &comp, ret))
-		assert(0);
 }
 
 static int rxm_cq_close(struct fid *fid)

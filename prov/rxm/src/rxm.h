@@ -60,7 +60,8 @@
 #define RXM_MAJOR_VERSION 1
 #define RXM_MINOR_VERSION 0
 
-#define RXM_CTRL_VERSION 3
+#define RXM_OP_VERSION		3
+#define RXM_CTRL_VERSION	3
 
 #define RXM_BUF_SIZE	16384
 #define RXM_SAR_LIMIT	262144
@@ -91,10 +92,9 @@
 	       " (fi_addr: 0x%" PRIx64 " tag: 0x%" PRIx64 ")\n",\
 	       addr, tag)
 
-#define RXM_GET_PROTO_STATE(comp)			\
-	(*(enum rxm_proto_state *)			\
-	  ((unsigned char *)(comp)->op_context +	\
-		offsetof(struct rxm_buf, state)))
+#define RXM_GET_PROTO_STATE(context)					\
+	(*(enum rxm_proto_state *)					\
+	  ((unsigned char *)context + offsetof(struct rxm_buf, state)))
 
 #define RXM_SET_PROTO_STATE(comp, new_state)				\
 do {									\
@@ -134,7 +134,9 @@ struct rxm_mr {
 
 struct rxm_ep_wire_proto {
 	uint8_t	ctrl_version;
-	uint8_t ctrl_version_pad[7];
+	uint8_t	op_version;
+	uint8_t endianness;
+	uint8_t padding[6];
 	uint64_t eager_size;
 };
 
@@ -447,8 +449,8 @@ int rxm_endpoint(struct fid_domain *domain, struct fi_info *info,
 			  struct fid_ep **ep, void *context);
 
 struct util_cmap *rxm_conn_cmap_alloc(struct rxm_ep *rxm_ep);
-ssize_t rxm_cq_write_error(struct fid_cq *msg_cq, struct fi_cq_data_entry *comp,
-			   ssize_t err);
+void rxm_cq_write_error(struct util_cq *cq, struct util_cntr *cntr,
+			void *op_context, int err);
 void rxm_ep_progress_one(struct util_ep *util_ep);
 void rxm_ep_progress_multi(struct util_ep *util_ep);
 
@@ -573,30 +575,30 @@ rxm_process_recv_entry(struct rxm_recv_queue *recv_queue,
 	return FI_SUCCESS;
 }
 
+static inline struct rxm_conn *
+rxm_acquire_conn(struct rxm_ep *rxm_ep, fi_addr_t fi_addr)
+{
+	return container_of(ofi_cmap_acquire_handle(rxm_ep->util_ep.cmap,
+						    fi_addr),
+			    struct rxm_conn, handle);
+}
+
+
 /* Caller must hold `cmap::lock` */
 static inline int
-rxm_ep_handle_unconnected(struct rxm_ep *rxm_ep, struct util_cmap_handle **handle,
+rxm_ep_handle_unconnected(struct rxm_ep *rxm_ep, struct util_cmap_handle *handle,
 			  fi_addr_t dest_addr)
 {
 	int ret;
 
-	if (OFI_UNLIKELY(!*handle)) {
-		FI_DBG(&rxm_prov, FI_LOG_EP_CTRL,
-		       "No handle found for given fi_addr\n");
-		ret = util_cmap_alloc_handle(rxm_ep->util_ep.cmap,
-					     dest_addr, CMAP_IDLE,
-					     handle);
-		if (OFI_UNLIKELY(ret))
-			return -FI_ENOMEM;
-	}
-	if ((*handle)->state == CMAP_CONNECTED_NOTIFY) {
-		ofi_cmap_process_conn_notify(rxm_ep->util_ep.cmap, *handle);
+	if (handle->state == CMAP_CONNECTED_NOTIFY) {
+		ofi_cmap_process_conn_notify(rxm_ep->util_ep.cmap, handle);
 		return 0;
 	}
 	/* Since we handling unoonnected state and `cmap:lock`
 	 * is on hold, it shouldn't return 0 */
 	ret = ofi_cmap_handle_connect(rxm_ep->util_ep.cmap,
-				      dest_addr, *handle);
+				      dest_addr, handle);
 	if (OFI_UNLIKELY(ret != -FI_EAGAIN))
 		return ret;
 
